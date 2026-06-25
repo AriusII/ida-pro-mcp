@@ -23,6 +23,17 @@ import ida_auto
 
 def main() -> int:
     """Entry point for ida-mcp-test command."""
+    # Test output (assertion messages, IDA strings) routinely contains non-ASCII
+    # characters (≥, →, struct field names from real binaries). On Windows the
+    # console / a redirected pipe often defaults to cp1252, where printing such a
+    # character raises UnicodeEncodeError mid-report and silently truncates the
+    # failure list. Force UTF-8 with replacement so the summary always prints.
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
     parser = argparse.ArgumentParser(
         description="Run IDA Pro MCP tests using idalib",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -108,7 +119,7 @@ With coverage:
 
     try:
         # Import test framework AFTER idalib is initialized
-        from ida_pro_mcp.ida_mcp.framework import run_tests, TESTS
+        from ida_pro_mcp.ida_mcp._kernel.framework import run_tests, TESTS
 
         # Import all test modules to register @test decorators.
         # Use pkgutil discovery so registration works even if tests package

@@ -1,6 +1,6 @@
 """Binary-specific tests for tests/typed_fixture.elf."""
 
-from ..framework import test, assert_is_list, assert_ok, skip_test
+from .._kernel.framework import test, assert_is_list, assert_ok, skip_test, patching_enabled
 from ..api_core import lookup_funcs, find_regex, list_globals
 from ..api_analysis import (
     decompile,
@@ -131,13 +131,19 @@ def test_typed_fixture_put_int_roundtrip():
     """typed fixture integer array can be patched and restored through put_int."""
     original = get_bytes({"addr": G_NUMBERS, "size": 4})[0]["data"]
     original_plain = _plain_hex_bytes(original)
-    try:
-        written = put_int({"addr": G_NUMBERS, "ty": "u32", "value": "99"})[0]
-        assert "error" not in written
-        roundtrip = get_int({"addr": G_NUMBERS, "ty": "u32"})[0]
-        assert roundtrip["value"] == 99
-    finally:
-        patch({"addr": G_NUMBERS, "data": original_plain})
+    with patching_enabled():
+        try:
+            written = put_int(
+                {"addr": G_NUMBERS, "ty": "u32", "value": "99"}, confirm=True, dry_run=False
+            )
+            assert written["applied"] is True
+            assert "error" not in written["results"][0]
+            roundtrip = get_int({"addr": G_NUMBERS, "ty": "u32"})[0]
+            assert roundtrip["value"] == 99
+        finally:
+            patch(
+                {"addr": G_NUMBERS, "data": original_plain}, confirm=True, dry_run=False
+            )
 
 
 @test(binary="typed_fixture.elf")
@@ -152,9 +158,16 @@ def test_typed_fixture_struct_types_and_resources():
     assert "error" not in set_point
     auto = read_struct({"addr": G_POINT})[0]
     assert auto["struct"] == "Point"
-    members = {m["name"]: m["value"] for m in auto["members"]}
-    assert members["x"].endswith("(11)")
-    assert members["y"].endswith("(22)")
+    members = {m["name"]: str(m["value"]) for m in auto["members"]}
+    # value is a type-aware repr now ("11" or "0xb (11)"); decode the number.
+    import re
+
+    def _last_num(text):
+        found = re.findall(r"0x[0-9a-fA-F]+|-?\d+", text)
+        return int(found[-1], 0) if found else None
+
+    assert _last_num(members["x"]) == 11
+    assert _last_num(members["y"]) == 22
 
     wrapper = struct_name_resource("Wrapper")
     assert "error" not in wrapper

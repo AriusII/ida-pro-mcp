@@ -16,11 +16,14 @@ import ida_xref
 import idaapi
 import idautils
 
-from . import compat
-from .rpc import safety, title, tool
-from .sync import idasync, tool_timeout
-from .utils import (
+from ._kernel import compat
+from ._kernel.errors import InvalidArgumentError
+from ._kernel.rpc import safety, title, tool
+from ._kernel.sync import idasync, tool_timeout
+from ._kernel.utils import (
     parse_address,
+    get_cached_cfunc,
+    iter_func_call_edges,
     normalize_list_input,
     normalize_dict_list,
     get_function,
@@ -207,6 +210,7 @@ class CalleesResult(TypedDict, total=False):
     addr: str
     callees: list[CalleeResultItem] | None
     more: bool
+    has_indirect: bool
     error: str
 
 
@@ -225,6 +229,25 @@ class BasicBlocksResult(TypedDict, total=False):
     count: int
     total_blocks: int
     cursor: ResultCursor
+
+
+class EaToPseudocodeResult(TypedDict, total=False):
+    addr: str
+    func: str | None
+    line_no: int | None
+    line: str | None
+    line_eas: list[str]
+    error: str
+    truncated: bool
+
+
+class PseudocodeLineToEasResult(TypedDict, total=False):
+    func: str
+    line_no: int
+    line: str | None
+    eas: list[str]
+    error: str
+    truncated: bool
 
 
 class FindResult(TypedDict, total=False):
@@ -773,19 +796,26 @@ RETURNS: {addr, code, refs?, error?}. `code` is null with `error` set when decom
 PRO-TIP: Keep `include_addresses=true` while exploring so you can copy a `/*0xNNNN*/` marker straight into `disasm`/`xrefs_to`; flip it off only for a final clean read. PITFALL: this takes one address, not a list -- call it once per function."""
     try:
         start = parse_address(addr)
+        # SINGLE-PASS: decompile once via the per-IDB cfunc cache, then derive
+        # BOTH the pseudocode text and the referenced-object `refs` from that one
+        # cfunc. decompile_function_safe() is backed by the same cache (keyed on
+        # the enclosing function's start_ea), so the text render reuses this exact
+        # decompilation rather than triggering a second Hex-Rays pass.
+        cfunc, cf_err = get_cached_cfunc(start)
+        if cfunc is None:
+            return {
+                "addr": addr,
+                "code": None,
+                "error": cf_err or "Decompilation failed",
+            }
         code, err = decompile_function_safe(start, include_addresses=include_addresses)
         if code is None:
             return {"addr": addr, "code": None, "error": err or "Decompilation failed"}
         result: DecompileResult = {"addr": addr, "code": code}
         try:
-            import ida_hexrays
-
-            if ida_hexrays.init_hexrays_plugin():
-                cfunc = ida_hexrays.decompile(start)
-                if cfunc:
-                    refs = _collect_decompile_refs(cfunc)
-                    if refs:
-                        result["refs"] = refs
+            refs = _collect_decompile_refs(cfunc)
+            if refs:
+                result["refs"] = refs
         except Exception:
             pass
         return result
@@ -1604,54 +1634,49 @@ PRO-TIP: The 'external' tag quickly surfaces which API/imports a function leans 
                     {"addr": fn_addr, "callees": None, "error": "No function found"}
                 )
                 continue
-            func_end = func.end_ea
-            callees_dict = {}
+
+            # Derive call edges from the shared chunk/tailcall/switch-aware
+            # primitive so `callees` agrees exactly with api_graph's traversal
+            # (same source of truth, transpose of `callers`). This picks up
+            # tailcalls and resolved jump-table targets that the old per-insn
+            # NN_call scan missed, and surfaces unresolved indirect sites.
+            callees_dict: dict[int, dict] = {}
+            indirect_seen = False
             more = False
-            current_ea = func_start
-            while current_ea < func_end:
+            for edge in iter_func_call_edges(func_start, "out"):
                 if len(callees_dict) >= limit:
                     more = True
                     break
-                insn = _decode_insn_at(current_ea)
-                if insn is None:
-                    next_ea = _next_head(current_ea, func_end)
-                    if next_ea == idaapi.BADADDR:
-                        break
-                    current_ea = next_ea
+                if edge.get("indirect") or edge.get("to") is None:
+                    # Unresolved indirect/virtual callsite: tag once so callers
+                    # know indirect targets exist without a per-site explosion.
+                    indirect_seen = True
                     continue
-                if insn.itype in [idaapi.NN_call, idaapi.NN_callfi, idaapi.NN_callni]:
-                    op0 = insn.ops[0]
-                    if op0.type in (ida_ua.o_mem, ida_ua.o_near, ida_ua.o_far):
-                        target = op0.addr
-                    elif op0.type == ida_ua.o_imm:
-                        target = op0.value
-                    else:
-                        target = None
-                    if target is not None and target not in callees_dict:
-                        func_type = (
-                            "internal"
-                            if idaapi.get_func(target) is not None
-                            else "external"
-                        )
-                        func_name = ida_name.get_name(target)
-                        if func_name is not None:
-                            callees_dict[target] = {
-                                "addr": hex(target),
-                                "name": func_name,
-                                "type": func_type,
-                            }
-                next_ea = _next_head(current_ea, func_end)
-                if next_ea == idaapi.BADADDR:
-                    break
-                current_ea = next_ea
-
-            results.append(
-                {
-                    "addr": fn_addr,
-                    "callees": list(callees_dict.values()),
-                    "more": more,
+                target = int(edge["to"])
+                if target in callees_dict:
+                    continue
+                func_name = edge.get("target_name") or ida_name.get_name(target)
+                if not func_name:
+                    continue
+                func_type = (
+                    "internal"
+                    if idaapi.get_func(target) is not None
+                    else "external"
+                )
+                callees_dict[target] = {
+                    "addr": hex(target),
+                    "name": func_name,
+                    "type": func_type,
                 }
-            )
+
+            entry: dict = {
+                "addr": fn_addr,
+                "callees": list(callees_dict.values()),
+                "more": more,
+            }
+            if indirect_seen:
+                entry["has_indirect"] = True
+            results.append(entry)
         except Exception as e:
             results.append({"addr": fn_addr, "callees": None, "error": str(e)})
 
@@ -1768,6 +1793,239 @@ PRO-TIP: Mask out displacement/immediate bytes with '??' to make a signature sur
 # ============================================================================
 
 
+# Maximum pseudocode lines we will scan/index when bridging ea<->line. Bounds
+# the token/work cost on pathologically large functions; mapping degrades to a
+# `truncated` flag past this rather than fanning out unboundedly.
+_PSEUDO_LINE_BUDGET = 4000
+
+
+# Readable names for IDA's fc_block_type_t (FlowChart block.type) values. Built
+# lazily from the live ida_gdl constants so it tracks the running SDK rather than
+# hard-coding integers that drift across versions.
+_BLOCK_TYPE_NAMES: dict[int, str] | None = None
+
+
+def _block_type_name(bt: int) -> str:
+    """Resolve a FlowChart block.type integer to a readable fc_block_type_t name
+    (e.g. 'NORMAL', 'RET', 'CNDJMP', 'INDJUMP'), falling back to the raw int."""
+    global _BLOCK_TYPE_NAMES
+    if _BLOCK_TYPE_NAMES is None:
+        names: dict[int, str] = {}
+        try:
+            import ida_gdl
+            for attr in dir(ida_gdl):
+                if attr.startswith("fcb_"):
+                    val = getattr(ida_gdl, attr)
+                    if isinstance(val, int):
+                        # 'fcb_normal' -> 'NORMAL'
+                        names.setdefault(val, attr[len("fcb_"):].upper())
+        except Exception:
+            names = {}
+        _BLOCK_TYPE_NAMES = names
+    return _BLOCK_TYPE_NAMES.get(bt, f"TYPE_{bt}")
+
+
+def _build_line_ea_index(cfunc) -> tuple[dict[int, list[int]], dict[int, int], bool]:
+    """Walk a decompiled function's rendered pseudocode once and build a bounded
+    bidirectional map between source line numbers and instruction addresses.
+
+    Returns (line_to_eas, ea_to_line, truncated):
+      - line_to_eas: {line_no -> sorted [ea, ...]} of every distinct address the
+        decompiler attributes to that line (via the cfunc eamap / boundaries).
+      - ea_to_line: {ea -> line_no} inverse (first/lowest line wins per ea).
+      - truncated: True if the function exceeded `_PSEUDO_LINE_BUDGET` lines and
+        the index is partial.
+
+    Strategy: the eamap (`cfunc.get_eamap()`) maps each ea to the ctree items it
+    drives; each item carries an `.ea`. We render the pseudocode (`get_pseudocode`)
+    and, per line, recover the representative item via `get_line_item` to learn
+    the line's address, then attach every eamap ea whose nearest item ea falls on
+    that line. This avoids a second decompile and stays O(lines)."""
+    import ida_hexrays
+    import ida_kernwin
+
+    line_to_eas: dict[int, set[int]] = {}
+    ea_to_line: dict[int, int] = {}
+    truncated = False
+
+    # eamap: ea -> [citem_t, ...]; invert to item-ea -> source ea so we can map
+    # the per-line representative item back onto concrete instruction addresses.
+    item_ea_to_eas: dict[int, set[int]] = {}
+    try:
+        eamap = cfunc.get_eamap()
+        for src_ea, items in eamap.items():
+            for it in items:
+                iea = getattr(it, "ea", idaapi.BADADDR)
+                if iea != idaapi.BADADDR:
+                    item_ea_to_eas.setdefault(iea, set()).add(src_ea)
+    except Exception:
+        item_ea_to_eas = {}
+
+    sv = cfunc.get_pseudocode()
+    for idx, sl in enumerate(sv):
+        if idx >= _PSEUDO_LINE_BUDGET:
+            truncated = True
+            break
+        sl: ida_kernwin.simpleline_t
+        _head = ida_hexrays.ctree_item_t()
+        item = ida_hexrays.ctree_item_t()
+        _tail = ida_hexrays.ctree_item_t()
+        if not cfunc.get_line_item(sl.line, 0, False, _head, item, _tail):
+            continue
+        # The representative item's dstr() is "<hexea>: <expr>" when it carries
+        # an address; that hexea is this line's anchor address.
+        anchor_ea: int | None = None
+        try:
+            dstr = item.dstr()
+            if dstr:
+                ds = dstr.split(": ")
+                if len(ds) == 2:
+                    anchor_ea = int(ds[0], 16)
+        except Exception:
+            anchor_ea = None
+        if anchor_ea is None:
+            continue
+        eas = line_to_eas.setdefault(idx, set())
+        eas.add(anchor_ea)
+        # Pull in every concrete ea the eamap attributes to this anchor item so
+        # a single source line can expand to all its underlying instructions.
+        for extra in item_ea_to_eas.get(anchor_ea, ()):  # type: ignore[arg-type]
+            eas.add(extra)
+        for e in eas:
+            # First (lowest) line wins for a given ea -> stable inverse mapping.
+            if e not in ea_to_line or idx < ea_to_line[e]:
+                ea_to_line[e] = idx
+
+    sorted_map: dict[int, list[int]] = {
+        ln: sorted(s) for ln, s in line_to_eas.items()
+    }
+    return sorted_map, ea_to_line, truncated
+
+
+@safety("READ")
+@title("Map Address To Pseudocode Line")
+@tool
+@idasync
+@tool_timeout(90.0)
+def map_ea_to_pseudocode(
+    addr: Annotated[str, "Instruction address (hex like '0x401037') or a symbol name inside a function. The enclosing function is decompiled and the line covering this address is returned."],
+) -> EaToPseudocodeResult:
+    """WHAT: Pivots from a raw instruction address to the decompiled pseudocode line it belongs to, using the Hex-Rays eamap/boundaries, so you can jump from a disasm/xref hit straight into the C-like view.
+
+WHEN TO USE: After `disasm`, `xrefs_to`, or `find` hands you an address and you want to see where it lands in the pseudocode without eyeballing `/*0xNNNN*/` markers. The inverse of `map_pseudocode_line_to_eas`.
+
+RETURNS: {addr, func, line_no, line, line_eas[], truncated?, error?}. `line_no` is 0-based into the function's pseudocode (matching the decompiler's own line indexing); `line` is the rendered text of that line; `line_eas` are every address attributed to that same line. `error` is set when the address is outside a function or Hex-Rays is unavailable.
+
+PRO-TIP: Feed the returned `line_no` back into `map_pseudocode_line_to_eas` to get the full set of instructions for that line, or use `line_eas` directly. PITFALL: an exact address may sit between two lines (compiler scheduling); the nearest enclosing line is returned, and `truncated=true` means the function exceeded the line budget so a high line may be unmapped."""
+    try:
+        target = parse_address(addr)
+        func = idaapi.get_func(target)
+        if not func:
+            return {"addr": addr, "func": None, "line_no": None, "line": None,
+                    "line_eas": [], "error": "Address is not inside a function"}
+        cfunc, cf_err = get_cached_cfunc(func.start_ea)
+        if cfunc is None:
+            return {"addr": addr, "func": ida_funcs.get_func_name(func.start_ea),
+                    "line_no": None, "line": None, "line_eas": [],
+                    "error": cf_err or "Decompilation failed"}
+
+        line_to_eas, ea_to_line, truncated = _build_line_ea_index(cfunc)
+        func_name = ida_funcs.get_func_name(func.start_ea)
+
+        line_no = ea_to_line.get(target)
+        if line_no is None:
+            # No exact item carries this ea (e.g. mid-instruction or a prologue
+            # ea with no ctree item). Fall back to the nearest line whose ea set
+            # has the closest lower-or-equal anchor.
+            best_line: int | None = None
+            best_ea = -1
+            for ea, ln in ea_to_line.items():
+                if ea <= target and ea > best_ea:
+                    best_ea = ea
+                    best_line = ln
+            line_no = best_line
+
+        if line_no is None:
+            return {"addr": addr, "func": func_name, "line_no": None, "line": None,
+                    "line_eas": [], "truncated": truncated,
+                    "error": "No pseudocode line maps to this address"}
+
+        line_text: str | None = None
+        try:
+            sv = cfunc.get_pseudocode()
+            if 0 <= line_no < len(sv):
+                line_text = compact_whitespace(ida_lines.tag_remove(sv[line_no].line))
+        except Exception:
+            line_text = None
+
+        result: EaToPseudocodeResult = {
+            "addr": addr,
+            "func": func_name,
+            "line_no": line_no,
+            "line": line_text,
+            "line_eas": [hex(e) for e in line_to_eas.get(line_no, [])],
+        }
+        if truncated:
+            result["truncated"] = True
+        return result
+    except Exception as e:
+        return {"addr": addr, "func": None, "line_no": None, "line": None,
+                "line_eas": [], "error": str(e)}
+
+
+@safety("READ")
+@title("Map Pseudocode Line To Addresses")
+@tool
+@idasync
+@tool_timeout(90.0)
+def map_pseudocode_line_to_eas(
+    func: Annotated[str, "Function address (hex like '0x401000') or symbol name whose pseudocode you are indexing into."],
+    line: Annotated[int, "0-based pseudocode line number (as reported by `map_ea_to_pseudocode` or the decompiler's own line indexing) to resolve back to instruction addresses."],
+) -> PseudocodeLineToEasResult:
+    """WHAT: Resolves a single decompiled pseudocode line back to the set of instruction addresses Hex-Rays attributes to it, the inverse of `map_ea_to_pseudocode`.
+
+WHEN TO USE: When reading `decompile` output and you want to set a breakpoint, patch, or run `disasm`/`xrefs_to` against the exact instructions behind one suspicious line of C.
+
+RETURNS: {func, line_no, line, eas[], truncated?, error?}. `line` is the rendered text at that index; `eas` is the sorted list of addresses for it (empty when the line is pure decompiler scaffolding like a brace or declaration with no backing instruction). `error` is set for a bad function or missing Hex-Rays.
+
+PRO-TIP: `eas[0]` is typically the line's entry address -- a good breakpoint/patch target. PITFALL: line numbers are 0-based and specific to the *current* decompilation; if you rename/retype and force a recompile, re-fetch them. `truncated=true` means the function exceeded the line budget and high line numbers may resolve empty."""
+    try:
+        ea = parse_address(func)
+        f = idaapi.get_func(ea)
+        if not f:
+            return {"func": func, "line_no": line, "line": None, "eas": [],
+                    "error": "Function not found"}
+        if line < 0:
+            return {"func": func, "line_no": line, "line": None, "eas": [],
+                    "error": "Line number must be >= 0"}
+        cfunc, cf_err = get_cached_cfunc(f.start_ea)
+        if cfunc is None:
+            return {"func": func, "line_no": line, "line": None, "eas": [],
+                    "error": cf_err or "Decompilation failed"}
+
+        line_to_eas, _ea_to_line, truncated = _build_line_ea_index(cfunc)
+
+        line_text: str | None = None
+        try:
+            sv = cfunc.get_pseudocode()
+            if 0 <= line < len(sv):
+                line_text = compact_whitespace(ida_lines.tag_remove(sv[line].line))
+        except Exception:
+            line_text = None
+
+        result: PseudocodeLineToEasResult = {
+            "func": func,
+            "line_no": line,
+            "line": line_text,
+            "eas": [hex(e) for e in line_to_eas.get(line, [])],
+        }
+        if truncated:
+            result["truncated"] = True
+        return result
+    except Exception as e:
+        return {"func": func, "line_no": line, "line": None, "eas": [], "error": str(e)}
+
+
 @safety("READ")
 @title("Get Function Basic Blocks (CFG)")
 @tool
@@ -1779,13 +2037,13 @@ def basic_blocks(
     ] = 1000,
     offset: Annotated[int, "Skip the first N blocks before collecting (default: 0). Feed the cursor's `next` here to continue."] = 0,
 ) -> list[BasicBlocksResult]:
-    """WHAT: Returns a function's control-flow graph as basic blocks -- each with start/end address, size, block type, and its successor/predecessor block addresses -- with pagination.
+    """WHAT: Returns a function's control-flow graph as basic blocks -- each with start/end address, size, decoded block type, successor/predecessor block addresses, and loop tagging (back-edges / loop-header / loop-tail) -- with pagination.
 
 WHEN TO USE: To reason about control flow explicitly: branch structure, loop bodies, fall-through vs jump targets, or to drive your own CFG analysis. For call-level structure use `callgraph`; for the linear instruction listing use `disasm`.
 
-RETURNS: list of {addr, blocks:[BasicBlock...], count, total_blocks, cursor} (or {addr, error, blocks:[], cursor}). `total_blocks` is the full CFG size; `cursor` is {next:N} or {done:true}.
+RETURNS: list of {addr, blocks:[BasicBlock...], count, total_blocks, cursor} (or {addr, error, blocks:[], cursor}). Each block adds `type_name` (readable fc_block_type_t, e.g. 'NORMAL'/'RET'/'CNDJMP') and, when it closes a loop, `back_edges:[hexaddr...]` + `is_loop_tail:true`; targets of a back-edge get `is_loop_header:true`. `total_blocks` is the full CFG size; `cursor` is {next:N} or {done:true}.
 
-PRO-TIP: Use the successors/predecessors lists to walk the graph and identify loop back-edges without re-decoding instructions. PITFALL: `count` is the page size, `total_blocks` is the whole function -- compare them before assuming you have the full CFG."""
+PRO-TIP: Loop detection is precomputed -- scan for `is_loop_header` to find loop entries and `back_edges` to see which block jumps back to them, no instruction re-decoding required. PITFALL: `count` is the page size, `total_blocks` is the whole function -- compare them before assuming you have the full CFG; loop tags are computed over the full CFG, not just the returned page."""
     addrs = normalize_list_input(addrs)
 
     # Enforce max limit
@@ -1812,16 +2070,35 @@ PRO-TIP: Use the successors/predecessors lists to walk the graph and identify lo
             all_blocks = []
 
             for block in flowchart:
-                all_blocks.append(
-                    BasicBlock(
-                        start=hex(block.start_ea),
-                        end=hex(block.end_ea),
-                        size=block.end_ea - block.start_ea,
-                        type=block.type,
-                        successors=[hex(succ.start_ea) for succ in block.succs()],
-                        predecessors=[hex(pred.start_ea) for pred in block.preds()],
-                    )
+                succ_eas = [succ.start_ea for succ in block.succs()]
+                # A successor whose start address is <= this block's start is a
+                # back-edge (it jumps to an already-seen point in the listing) =>
+                # this block closes a loop and that successor is the loop header.
+                back_edges = sorted(
+                    {hex(s) for s in succ_eas if s <= block.start_ea}
                 )
+                bb: dict = {
+                    "start": hex(block.start_ea),
+                    "end": hex(block.end_ea),
+                    "size": block.end_ea - block.start_ea,
+                    "type": block.type,
+                    "type_name": _block_type_name(block.type),
+                    "successors": [hex(s) for s in succ_eas],
+                    "predecessors": [hex(pred.start_ea) for pred in block.preds()],
+                }
+                if back_edges:
+                    bb["back_edges"] = back_edges
+                    bb["is_loop_tail"] = True
+                all_blocks.append(bb)
+
+            # Second pass: a block is a loop header iff some other block has a
+            # back-edge targeting it (i.e. it is the lower-address end of a loop).
+            loop_headers = {
+                be for b in all_blocks for be in b.get("back_edges", [])
+            }
+            for b in all_blocks:
+                if b["start"] in loop_headers:
+                    b["is_loop_header"] = True
 
             # Apply pagination
             total_blocks = len(all_blocks)
@@ -1908,6 +2185,7 @@ PRO-TIP: 'immediate' tries both 4- and 8-byte encodings and back-resolves to the
             matches = []
             skipped = 0
             more = False
+            scan_error: str | None = None
             try:
                 ea = ida_ida.inf_get_min_ea()
                 max_ea = ida_ida.inf_get_max_ea()
@@ -1926,8 +2204,10 @@ PRO-TIP: 'immediate' tries both 4- and 8-byte encodings and back-resolves to the
                                 more = next_ea != idaapi.BADADDR
                                 break
                         ea += 1
-            except Exception:
-                pass
+            except Exception as e:
+                # Surface the failure instead of silently returning a partial
+                # set with error=None (the audit flagged this swallow).
+                scan_error = str(e)
 
             if ida_kernwin.user_cancelled():
                 cursor = {"next": offset + len(matches), "cancelled": True}
@@ -1941,22 +2221,48 @@ PRO-TIP: 'immediate' tries both 4- and 8-byte encodings and back-resolves to the
                     "matches": matches,
                     "count": len(matches),
                     "cursor": cursor,
-                    "error": None,
+                    "error": scan_error,
                 }
             )
 
     elif type == "immediate":
-        # Search for immediate values
+        # Search for immediate values.
+        #
+        # PAGING: `offset` is interpreted as a RESUME ADDRESS (next_start-style
+        # cursor), not a count of matches to skip. The previous implementation
+        # re-scanned from every executable segment's start each page and skipped
+        # `offset` already-seen matches -- quadratic, because cursor.next =
+        # offset+limit forced re-decoding (and re-`_resolve_immediate_insn_start`)
+        # of the entire prefix on every page. Here a page resumes exactly at the
+        # last cursor EA, so each page costs O(page) decode work. Dedup is stable
+        # *within a single scan* (seen_insn) which is all that is needed once
+        # scanning is monotonic in address.
         for value in targets:
             if isinstance(value, str):
+                raw_value = value
                 try:
                     value = int(value, 0)
                 except ValueError:
-                    value = 0
+                    # Previously coerced to 0 (a silent wrong-result swallow):
+                    # report it as a structured invalid-argument error instead.
+                    err = InvalidArgumentError(
+                        f"Not a valid immediate: {raw_value!r}"
+                    )
+                    results.append(
+                        {
+                            "query": raw_value,
+                            "matches": [],
+                            "count": 0,
+                            "cursor": {"done": True},
+                            "error": err.message,
+                        }
+                    )
+                    continue
 
-            matches = []
-            skipped = 0
+            matches: list[str] = []
             more = False
+            next_resume = 0
+            scan_error: str | None = None
             try:
                 candidates = _value_candidates_for_immediate(value)
                 if not candidates:
@@ -1971,46 +2277,79 @@ PRO-TIP: 'immediate' tries both 4- and 8-byte encodings and back-resolves to the
                     )
                     continue
 
-                seen_insn = set()
+                resume_ea = offset if offset > 0 else 0
+                seen_insn: set[int] = set()
                 for seg_ea in idautils.Segments():
+                    if more:
+                        break
                     seg = idaapi.getseg(seg_ea)
                     if not seg or not (seg.perm & idaapi.SEGPERM_EXEC):
                         continue
+                    # Skip whole segments that lie entirely before the resume EA.
+                    if resume_ea and seg.end_ea <= resume_ea:
+                        continue
+                    scan_from = max(seg.start_ea, resume_ea)
+
+                    # Collect address-ordered immediate matches in this segment by
+                    # merging the per-encoding byte searches, advancing the single
+                    # cursor that lies furthest behind on each step.
+                    cursors = []
                     for normalized, size, pattern_bytes in candidates:
-                        ea = seg.start_ea
-                        while ea != idaapi.BADADDR and ea < seg.end_ea:
-                            ea = _raw_bin_search(
-                                ea, seg.end_ea, pattern_bytes, b"\xff" * size
+                        cursors.append(
+                            {
+                                "size": size,
+                                "bytes": pattern_bytes,
+                                "mask": b"\xff" * size,
+                                "normalized": normalized,
+                                "ea": scan_from,
+                            }
+                        )
+
+                    while not more:
+                        # Find next raw byte hit for each candidate at/after its ea.
+                        best_ea = idaapi.BADADDR
+                        for c in cursors:
+                            if c["ea"] == idaapi.BADADDR or c["ea"] >= seg.end_ea:
+                                continue
+                            hit = _raw_bin_search(
+                                c["ea"], seg.end_ea, c["bytes"], c["mask"]
                             )
-                            if ea == idaapi.BADADDR:
-                                break
-
-                            insn_start = _resolve_immediate_insn_start(
-                                ea, value, seg.start_ea, normalized
-                            )
-                            if insn_start is not None and insn_start not in seen_insn:
-                                seen_insn.add(insn_start)
-                                if skipped < offset:
-                                    skipped += 1
-                                else:
-                                    matches.append(hex(insn_start))
-                                    if len(matches) >= limit:
-                                        more = True
-                                        break
-
-                            ea += 1
-
-                        if more:
+                            c["ea"] = hit if hit != idaapi.BADADDR else idaapi.BADADDR
+                            if c["ea"] != idaapi.BADADDR and c["ea"] < best_ea:
+                                best_ea = c["ea"]
+                        if best_ea == idaapi.BADADDR:
                             break
-                    if more:
-                        break
-            except Exception:
-                pass
+
+                        # The normalized (masked) encoding of whichever candidate
+                        # landed here -- preserves matching of negative immediates
+                        # whose operand value IDA reports in masked form.
+                        alt_value = next(
+                            (c["normalized"] for c in cursors if c["ea"] == best_ea),
+                            None,
+                        )
+                        insn_start = _resolve_immediate_insn_start(
+                            best_ea, value, seg.start_ea, alt_value
+                        )
+                        if insn_start is not None and insn_start not in seen_insn:
+                            seen_insn.add(insn_start)
+                            if len(matches) >= limit:
+                                more = True
+                                next_resume = best_ea
+                                break
+                            matches.append(hex(insn_start))
+
+                        # Advance every cursor sitting on best_ea past it.
+                        for c in cursors:
+                            if c["ea"] == best_ea:
+                                c["ea"] = best_ea + 1
+            except Exception as e:
+                # Surface the failure instead of silently swallowing it.
+                scan_error = str(e)
 
             if ida_kernwin.user_cancelled():
-                cursor = {"next": offset + len(matches), "cancelled": True}
+                cursor = {"next": next_resume or offset, "cancelled": True}
             elif more:
-                cursor = {"next": offset + limit}
+                cursor = {"next": next_resume}
             else:
                 cursor = {"done": True}
             results.append(
@@ -2019,7 +2358,7 @@ PRO-TIP: 'immediate' tries both 4- and 8-byte encodings and back-resolves to the
                     "matches": matches,
                     "count": len(matches),
                     "cursor": cursor,
-                    "error": None,
+                    "error": scan_error,
                 }
             )
 

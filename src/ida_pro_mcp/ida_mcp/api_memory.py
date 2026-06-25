@@ -8,11 +8,20 @@ import re
 from typing import Annotated, NotRequired, TypedDict
 
 import ida_bytes
+import ida_nalt
 import idaapi
 
-from .rpc import tool, safety, title
-from .sync import idasync
-from .utils import (
+from ._kernel.rpc import tool, safety, title
+from ._kernel.sync import idasync
+from ._kernel.consent import (
+    capture_original,
+    patch_decision,
+    patching_allowed,
+    revert_span,
+    span_status,
+    withheld_hint,
+)
+from ._kernel.utils import (
     IntRead,
     IntWrite,
     MemoryPatch,
@@ -40,6 +49,7 @@ class IntReadResult(TypedDict):
 class StringReadResult(TypedDict):
     addr: str
     value: str | None
+    encoding: NotRequired[str]  # detected encoding (e.g. "utf-8", "utf-16-le", "pascal-utf-8")
     error: NotRequired[str]
 
 
@@ -60,6 +70,44 @@ class IntWriteResult(TypedDict):
     ty: str
     value: str | None
     error: NotRequired[str]
+
+
+class PatchItemResult(TypedDict, total=False):
+    addr: str | None
+    size: int
+    original: str  # hex of the bytes currently at addr (pre-write)
+    new: str  # hex of the bytes that were / would be written
+    applied: bool  # whether THIS item was actually written
+    ty: str  # put_int only: normalized integer class
+    value: str  # put_int only: echoed value
+    error: str
+
+
+class PatchResponse(TypedDict, total=False):
+    applied: bool  # whether ANY byte was actually written this call
+    dry_run: bool
+    allowed: bool  # server-level patch gate state
+    reason: str  # ok | dry_run | confirm_required | server_gate_closed
+    consent: str  # guidance shown when the write was withheld
+    results: list[PatchItemResult]
+
+
+class RevertResult(TypedDict, total=False):
+    addr: str
+    reverted: int  # count of bytes restored to their original value
+    error: str
+
+
+class PatchListEntry(TypedDict):
+    addr: str
+    original: str  # hex original byte
+    patched: str  # hex current (patched) byte
+
+
+class PatchListResult(TypedDict, total=False):
+    count: int
+    patches: list[PatchListEntry]
+    truncated: bool
 
 
 # ============================================================================
@@ -125,8 +173,15 @@ def _parse_int_class(text: str) -> tuple[int, bool, str, str]:
 
     bits = int(match.group("bits"))
     signed = match.group("sign") == "i"
-    endian = match.group("endian") or "le"
-    byte_order = "little" if endian == "le" else "big"
+    explicit = match.group("endian")  # "le" | "be" | None
+    if explicit:
+        # An explicit suffix is authoritative regardless of DB byte order.
+        byte_order = "little" if explicit == "le" else "big"
+        endian = explicit
+    else:
+        # No suffix: honor the database's recorded byte order (idaapi inf is_be).
+        byte_order = _db_byte_order()
+        endian = "be" if byte_order == "big" else "le"
     normalized = f"{'i' if signed else 'u'}{bits}{endian}"
     return bits, signed, byte_order, normalized
 
@@ -147,6 +202,57 @@ def _parse_int_value(text: str, signed: bool, bits: int) -> int:
     return value
 
 
+def _db_byte_order() -> str:
+    """Database default byte order ("big" or "little") per idaapi inf.
+
+    Used when an integer class carries no explicit le|be suffix so reads/writes
+    honor the analysed image's endianness instead of always assuming little.
+    Falls back to "little" if the inf flag cannot be queried. Mirrors the
+    robust probe in api_types._db_endian (ida_ida first, then idaapi).
+    """
+    try:
+        import ida_ida
+
+        if hasattr(ida_ida, "inf_is_be") and ida_ida.inf_is_be():
+            return "big"
+    except Exception:
+        pass
+    try:
+        if idaapi.inf_is_be():
+            return "big"
+    except Exception:
+        pass
+    return "little"
+
+
+# STRTYPE low-byte layout (IDA SDK):
+#   STRWIDTH mask (bits 0-1): character width / encoding selector
+#       0 -> 1 byte (C/UTF-8), 1 -> 2 byte (UTF-16), 2 -> 4 byte (UTF-32)
+#   STRLYT  (bits 6-7, value = (strtype >> 6) & 3): 0 = terminated, >0 = Pascal
+# Codecs are resolved from the width code; the DB byte order picks LE/BE for the
+# multi-byte forms.
+_STR_WIDTH_MASK = 0x03
+_STR_LAYOUT_SHIFT = 6
+_STR_LAYOUT_MASK = 0x03
+
+
+def _strtype_codec(strtype: int) -> str:
+    """Map a STRTYPE_* value to a Python codec name, honoring DB endianness."""
+    width = strtype & _STR_WIDTH_MASK
+    if width == 1:
+        return "utf-16-be" if _db_byte_order() == "big" else "utf-16-le"
+    if width == 2:
+        return "utf-32-be" if _db_byte_order() == "big" else "utf-32-le"
+    return "utf-8"
+
+
+def _strtype_encoding_label(strtype: int) -> str:
+    """Human-readable encoding label for a STRTYPE_* value (additive report)."""
+    codec = _strtype_codec(strtype)
+    layout = (strtype >> _STR_LAYOUT_SHIFT) & _STR_LAYOUT_MASK
+    return f"pascal-{codec}" if layout else codec
+
+
 @safety("READ")
 @title("Read Typed Integers")
 @tool
@@ -155,22 +261,26 @@ def get_int(
     queries: Annotated[
         list[IntRead] | IntRead,
         "One or more {ty, addr} read requests; ty selects width/sign/endianness "
-        "(i8/u8/i16/u16/i32/u32/i64/u64, optional le|be suffix, default le); "
-        "a single dict is accepted and wrapped",
+        "(i8/u8/i16/u16/i32/u32/i64/u64, optional le|be suffix; without a suffix "
+        "the database byte order is used); a single dict is accepted and wrapped",
     ],
 ) -> list[IntReadResult]:
     """Read width-, sign-, and endian-aware integers from memory.
 
     WHAT: For each {ty, addr}, parses the `ty` class to derive byte width,
     signedness, and byte order, reads that many bytes (BSS-safe), and decodes a
-    Python int. `ty` is normalized in the result (e.g. "u32" -> "u32le").
+    Python int. When `ty` has no le|be suffix the database byte order (idaapi
+    inf is_be) is used, so a big-endian image reads big-endian by default. `ty`
+    is normalized in the result to the byte order actually used (e.g. on a
+    little-endian DB "u32" -> "u32le", on a big-endian DB "u32" -> "u32be").
     WHEN-TO-USE: Reading a scalar field at a known offset (length prefix, flag
     word, pointer-sized value) when you want the decoded number, not raw bytes.
     RETURNS: One result per query, in input order: {addr, ty, value} on success
     (ty is the normalized class) or {addr, ty, value: null, error} on failure.
-    PITFALL: Endianness defaults to little-endian; pass an explicit be suffix
-    (e.g. "u32be") for big-endian data such as network byte order. Unsigned
-    classes always yield a non-negative value.
+    PITFALL: An explicit suffix is always authoritative; pass "u32be" to force
+    big-endian (e.g. network byte order) regardless of the database byte order,
+    or "u32le" to force little. Unsigned classes always yield a non-negative
+    value.
     """
     if isinstance(queries, dict):
         queries = [queries]
@@ -209,20 +319,24 @@ def get_string(
         "starts; a single string is accepted and wrapped",
     ],
 ) -> list[StringReadResult]:
-    """Read defined string literals from memory.
+    """Read defined string literals from memory, encoding-aware.
 
-    WHAT: For each address, fetches the string-literal contents IDA recognizes
-    at that exact start address and decodes them as UTF-8 (undecodable bytes are
-    replaced, never raising).
+    WHAT: For each address, detects IDA's string TYPE at that exact start address
+    (ida_nalt.get_str_type) and decodes the literal per its STRTYPE_* class:
+    C/UTF-8, UTF-16, UTF-32, or Pascal-length-prefixed forms. The multi-byte
+    encodings follow the database byte order. Undecodable bytes are replaced,
+    never raising. The detected encoding is reported alongside the value.
     WHEN-TO-USE: Resolving a string pointer/xref target to its text, or reading
-    a known string constant by address.
-    RETURNS: One result per address, in input order: {addr, value} on success or
-    {addr, value: null, error} on failure ("No string at address" when IDA has
-    no string item there).
+    a known string constant by address (including wide/UTF-16 strings).
+    RETURNS: One result per address, in input order: {addr, value, encoding} on
+    success or {addr, value: null, error} on failure ("No string at address"
+    when IDA has no string item there). `encoding` names the detected codec
+    (e.g. "utf-8", "utf-16-le", "pascal-utf-8").
     PITFALL: This reads only IDA's DEFINED string item at the precise address;
     it does not scan for an arbitrary null-terminated run, and an address in the
-    middle of a string yields no result. For non-UTF-8 encodings (e.g. CP949)
-    the replacement chars are expected; use get_bytes to recover the raw bytes.
+    middle of a string yields no result. When IDA has no string type recorded at
+    the address the C/UTF-8 class is assumed; use get_bytes to recover the raw
+    bytes for an exotic encoding (e.g. CP949) where replacement chars appear.
     """
     addrs = normalize_list_input(addrs)
     results = []
@@ -230,28 +344,64 @@ def get_string(
     for addr in addrs:
         try:
             ea = parse_address(addr)
-            raw = idaapi.get_strlit_contents(ea, -1, 0)
+            strtype = ida_nalt.get_str_type(ea)
+            if strtype is None or strtype < 0:
+                strtype = ida_nalt.STRTYPE_C
+            raw = ida_bytes.get_strlit_contents(ea, -1, strtype)
             if not raw:
                 results.append(
                     {"addr": addr, "value": None, "error": "No string at address"}
                 )
                 continue
-            value = raw.decode("utf-8", errors="replace")
-            results.append({"addr": addr, "value": value})
+            codec = _strtype_codec(strtype)
+            value = raw.decode(codec, errors="replace")
+            results.append(
+                {
+                    "addr": addr,
+                    "value": value,
+                    "encoding": _strtype_encoding_label(strtype),
+                }
+            )
         except Exception as e:
             results.append({"addr": addr, "value": None, "error": str(e)})
 
     return results
 
 
+def _is_char_array(tif) -> bool:
+    """True when ``tif`` is an array whose element is a (signed/unsigned) char."""
+    try:
+        if not tif.is_array():
+            return False
+    except Exception:
+        return False
+    try:
+        elem = tif.get_array_element()
+    except Exception:
+        return False
+    if elem is None:
+        return False
+    try:
+        if elem.is_decl_char():
+            return True
+    except Exception:
+        pass
+    # Fallback: a 1-byte integral element behaves like a char array for display.
+    try:
+        return bool(elem.is_integral()) and int(elem.get_size()) == 1
+    except Exception:
+        return False
+
+
 def get_global_variable_value_internal(ea: int) -> str:
     import ida_typeinf
     import ida_nalt
     import ida_bytes
-    from .sync import IDAError
+    from ._kernel.sync import IDAError
 
     tif = ida_typeinf.tinfo_t()
-    if not ida_nalt.get_tinfo(tif, ea):
+    have_type = ida_nalt.get_tinfo(tif, ea)
+    if not have_type:
         if not ida_bytes.has_any_name(ea):
             raise IDAError(f"Failed to get type information for variable at {ea:#x}")
 
@@ -261,11 +411,18 @@ def get_global_variable_value_internal(ea: int) -> str:
     else:
         size = tif.get_size()
 
-    if size == 0 and tif.is_array() and tif.get_array_element().is_decl_char():
-        raw = idaapi.get_strlit_contents(ea, -1, 0)
+    # A char[] global renders as a quoted string. The previous guard required
+    # size == 0, which never holds for a real char[N] (size N), so char arrays
+    # fell through to the byte-dump branch. Decode as a string whenever the type
+    # is a char array (size is irrelevant), honoring the recorded string type.
+    if have_type and _is_char_array(tif):
+        strtype = ida_nalt.get_str_type(ea)
+        if strtype is None or strtype < 0:
+            strtype = ida_nalt.STRTYPE_C
+        raw = ida_bytes.get_strlit_contents(ea, -1, strtype)
         if not raw:
             return '""'
-        return_string = raw.decode("utf-8", errors="replace").strip()
+        return_string = raw.decode(_strtype_codec(strtype), errors="replace").strip()
         return f'"{return_string}"'
 
     if size in (1, 2, 4, 8):
@@ -300,7 +457,7 @@ def get_global_value(
     untyped/mis-sized global may render as a hex scalar or raw bytes rather than
     the logical value. When you need an exact width/sign decode, use get_int.
     """
-    from .utils import looks_like_address
+    from ._kernel.utils import looks_like_address
 
     queries = normalize_list_input(queries)
     results = []
@@ -337,7 +494,7 @@ def get_global_value(
 # ============================================================================
 
 
-@safety("DESTRUCTIVE")
+@safety("PATCH")
 @title("Patch Bytes")
 @tool
 @idasync
@@ -347,48 +504,86 @@ def patch(
         "One or more {addr, data} patches; data is a hex byte string (spaces "
         "optional, e.g. '90 90' or '9090'); a single dict is accepted and wrapped",
     ],
-) -> list[PatchResult]:
-    """Overwrite bytes in the database at one or more addresses (DESTRUCTIVE).
+    confirm: Annotated[
+        bool,
+        "Explicit consent to write. With confirm=false (default) the call only "
+        "PREVIEWS (original vs new bytes); set confirm=true AND dry_run=false to apply.",
+    ] = False,
+    dry_run: Annotated[
+        bool,
+        "When true (default) the call previews and writes nothing. Set false "
+        "(with confirm=true) to actually patch.",
+    ] = True,
+) -> PatchResponse:
+    """Overwrite bytes of the analysed program, gated by explicit consent (PATCH).
 
-    WHAT: For each {addr, data}, parses `data` as hex bytes, verifies the
-    address is mapped, and patches the bytes into the IDB at `addr`. The patch
-    length equals the number of hex bytes supplied.
-    WHEN-TO-USE: Applying a binary edit (NOP-ing an instruction, flipping a
-    constant, neutralizing a check) directly in the database.
-    RETURNS: One result per patch, in input order: {addr, size} on success
-    (size = bytes written) or {addr, size: 0, error} on failure (e.g. "Address
-    not mapped" or a malformed hex string). Per-patch failures never abort the
-    batch.
-    PITFALL: This mutates the IDB and does NOT auto-align to instruction
-    boundaries; patching a partial instruction leaves stale disassembly until
-    re-analyzed. To write a typed scalar with width/endianness handled for you,
-    prefer put_int over hand-encoding hex here.
+    WHAT: For each {addr, data}, parses `data` as hex bytes, validates that every
+    byte of the span is mapped, captures the current (original) bytes, and — only
+    when the server patch gate is open AND confirm=true AND dry_run=false — writes
+    the new bytes into the IDB at `addr`. Otherwise it returns a non-writing
+    PREVIEW (original vs new) and touches nothing.
+    WHEN-TO-USE: ONLY when the user has explicitly asked to patch the binary
+    (e.g. NOP a check, flip a constant). Patching is never part of analysis; the
+    default previews so that understanding a binary never mutates it (axis-7
+    never-patch-without-consent rule).
+    RETURNS: A PatchResponse {applied, dry_run, allowed, reason, consent?,
+    results[]}. Each result is {addr, size, original, new, applied} on success or
+    {addr, size:0, error}. `allowed` reflects the server gate
+    (IDA_MCP_ALLOW_PATCH / set_patch_allowed); `reason` explains any withholding.
+    PITFALL: Patching does NOT auto-align to instruction boundaries; a partial
+    instruction leaves stale disassembly until re-analysed. Use revert_patch to
+    undo and list_patches to review. To write a typed scalar (width/endianness
+    handled) prefer put_int over hand-encoding hex here.
     """
     if isinstance(patches, dict):
         patches = [patches]
 
-    results = []
+    will_write, reason = patch_decision(confirm, dry_run)
+    results: list[dict] = []
+    any_applied = False
 
-    for patch in patches:
+    for item in patches:
+        addr_str = item.get("addr") if isinstance(item, dict) else None
         try:
-            ea = parse_address(patch["addr"])
-            data = bytes.fromhex(patch["data"])
-
-            if not ida_bytes.is_mapped(ea):
-                raise ValueError(f"Address not mapped: {patch['addr']}")
-
-            ida_bytes.patch_bytes(ea, data)
-            results.append(
-                {"addr": patch["addr"], "size": len(data)}
-            )
-
+            ea = parse_address(item["addr"])
+            data = bytes.fromhex(item["data"])
+            size = len(data)
+            if size == 0:
+                raise ValueError("empty patch data")
+            mapped, bad_ea = span_status(ea, size)
+            if not mapped:
+                raise ValueError(
+                    f"Address span not fully mapped (first unmapped byte at "
+                    f"{hex(bad_ea)} in {hex(ea)}..{hex(ea + size)})"
+                )
+            entry: dict = {
+                "addr": item["addr"],
+                "size": size,
+                "original": capture_original(ea, size),
+                "new": data.hex(),
+                "applied": False,
+            }
+            if will_write:
+                ida_bytes.patch_bytes(ea, data)
+                entry["applied"] = True
+                any_applied = True
+            results.append(entry)
         except Exception as e:
-            results.append({"addr": patch.get("addr"), "size": 0, "error": str(e)})
+            results.append({"addr": addr_str, "size": 0, "error": str(e)})
 
-    return results
+    response: dict = {
+        "applied": any_applied,
+        "dry_run": dry_run,
+        "allowed": patching_allowed(),
+        "reason": reason,
+        "results": results,
+    }
+    if not will_write:
+        response["consent"] = withheld_hint(reason)
+    return response
 
 
-@safety("DESTRUCTIVE")
+@safety("PATCH")
 @title("Write Typed Integers")
 @tool
 @idasync
@@ -396,32 +591,46 @@ def put_int(
     items: Annotated[
         list[IntWrite] | IntWrite,
         "One or more {ty, addr, value} writes; ty selects width/sign/endianness "
-        "(i8/u8/.../u64, optional le|be, default le); value is a STRING decimal "
-        "or 0x.. (negatives allowed for signed types); a single dict is accepted "
-        "and wrapped",
+        "(i8/u8/.../u64, optional le|be; without a suffix the database byte order "
+        "is used); value is a STRING decimal or 0x.. (negatives allowed for "
+        "signed types); a single dict is accepted and wrapped",
     ],
-) -> list[IntWriteResult]:
-    """Encode and write width-/sign-/endian-aware integers to memory (DESTRUCTIVE).
+    confirm: Annotated[
+        bool,
+        "Explicit consent to write. confirm=false (default) previews only; set "
+        "confirm=true AND dry_run=false to apply.",
+    ] = False,
+    dry_run: Annotated[
+        bool,
+        "When true (default) previews and writes nothing; set false (with "
+        "confirm=true) to actually write.",
+    ] = True,
+) -> PatchResponse:
+    """Encode and write width-/sign-/endian-aware integers, gated by consent (PATCH).
 
     WHAT: For each {ty, addr, value}, parses the integer class and the string
     value, encodes it to the target width/byte order (rejecting out-of-range or
-    wrongly-signed values), verifies the address is mapped, and patches the bytes
-    into the IDB at `addr`.
-    WHEN-TO-USE: Setting a scalar field/constant by its logical value without
-    hand-encoding hex; complements patch (raw bytes) and get_int (the read side).
-    RETURNS: One result per item, in input order: {addr, ty, value} on success
-    (ty normalized, value echoed as a string) or {addr, ty, value, error} on
-    failure (overflow, negative-into-unsigned, unmapped address, bad value).
-    Per-item failures never abort the batch.
-    PITFALL: `value` is a STRING, not a number, so quote it ("0x10", "-5"); a
-    bare unquoted int will be coerced but the string form is the contract.
-    Default endianness is little-endian; pass an explicit be class for
-    big-endian/network targets. This mutates the IDB.
+    wrongly-signed values), validates the span is mapped, captures the original
+    bytes, and writes only when the patch gate is open AND confirm=true AND
+    dry_run=false; otherwise PREVIEWS without writing.
+    WHEN-TO-USE: Setting a scalar field/constant by its logical value (without
+    hand-encoding hex), ONLY when the user explicitly asked to patch. Complements
+    patch (raw bytes) and get_int (the read side).
+    RETURNS: A PatchResponse {applied, dry_run, allowed, reason, consent?,
+    results[]}; each result is {addr, ty, value, size, original, new, applied} on
+    success or {addr, ty, value, error} on failure.
+    PITFALL: `value` is a STRING ("0x10", "-5"). Without an le|be suffix the
+    database byte order is used; pass an explicit be class for big-endian/network
+    targets or le to force little regardless of the DB. Patching is withheld
+    unless explicitly enabled and confirmed (axis-7 rule).
     """
     if isinstance(items, dict):
         items = [items]
 
-    results = []
+    will_write, reason = patch_decision(confirm, dry_run)
+    results: list[dict] = []
+    any_applied = False
+
     for item in items:
         addr = item.get("addr", "")
         ty = item.get("ty", "")
@@ -437,16 +646,26 @@ def put_int(
                 raise ValueError(f"Value {value_text} does not fit in {normalized}")
 
             ea = parse_address(addr)
-            if not ida_bytes.is_mapped(ea):
-                raise ValueError(f"Address not mapped: {addr}")
-            ida_bytes.patch_bytes(ea, data)
-            results.append(
-                {
-                    "addr": addr,
-                    "ty": normalized,
-                    "value": str(value_text),
-                }
-            )
+            mapped, bad_ea = span_status(ea, size)
+            if not mapped:
+                raise ValueError(
+                    f"Address span not fully mapped (first unmapped byte at "
+                    f"{hex(bad_ea)} in {hex(ea)}..{hex(ea + size)})"
+                )
+            entry: dict = {
+                "addr": addr,
+                "ty": normalized,
+                "value": str(value_text),
+                "size": size,
+                "original": capture_original(ea, size),
+                "new": data.hex(),
+                "applied": False,
+            }
+            if will_write:
+                ida_bytes.patch_bytes(ea, data)
+                entry["applied"] = True
+                any_applied = True
+            results.append(entry)
         except Exception as e:
             results.append(
                 {
@@ -457,4 +676,90 @@ def put_int(
                 }
             )
 
-    return results
+    response: dict = {
+        "applied": any_applied,
+        "dry_run": dry_run,
+        "allowed": patching_allowed(),
+        "reason": reason,
+        "results": results,
+    }
+    if not will_write:
+        response["consent"] = withheld_hint(reason)
+    return response
+
+
+@safety("PATCH")
+@title("Revert Patched Bytes")
+@tool
+@idasync
+def revert_patch(
+    addr: Annotated[str, "Address (hex like '0x401000' or a symbol) of the first byte to revert."],
+    size: Annotated[int, "Number of bytes to revert starting at addr (default 1)."] = 1,
+) -> RevertResult:
+    """Restore previously-patched bytes to their ORIGINAL values (the patch undo).
+
+    WHAT: Reverts IDA's recorded patched bytes over [addr, addr+size) back to the
+    values they held before any patch, using IDA's native patched-byte store — so
+    it can only ever RESTORE original content, never introduce new bytes. For that
+    reason it is always permitted (it is the antidote to patching, not a patch).
+    WHEN-TO-USE: To undo a patch applied via patch / put_int / patch_asm, or to
+    clean up an experiment.
+    RETURNS: {addr, reverted} where reverted is the count of bytes actually
+    restored (bytes that were never patched are left untouched), or {addr,
+    reverted:0, error} on a bad address.
+    PRO-TIP: Call list_patches first to see exactly which bytes are patched.
+    """
+    try:
+        ea = parse_address(addr)
+    except Exception as e:
+        return {"addr": addr, "reverted": 0, "error": str(e)}
+    if size < 1:
+        size = 1
+    return {"addr": addr, "reverted": revert_span(ea, size)}
+
+
+@safety("READ")
+@title("List Patched Bytes")
+@tool
+@idasync
+def list_patches(
+    limit: Annotated[int, "Maximum patched bytes to report; clamped to 1..100000 (default 1000)."] = 1000,
+) -> PatchListResult:
+    """List every byte currently patched in the database (original vs current).
+
+    WHAT: Enumerates IDA's patched-byte store across the whole image, reporting
+    each location's original and current (patched) byte. This is the read side of
+    the patch lifecycle and never mutates anything.
+    WHEN-TO-USE: To audit what has been patched (before reverting, or to confirm a
+    read-only workflow left the binary untouched — an empty list proves no bytes
+    were patched).
+    RETURNS: {count, patches:[{addr, original, patched}], truncated}; `truncated`
+    is true when more patched bytes exist than `limit`.
+    """
+    if limit < 1:
+        limit = 1
+    elif limit > 100000:
+        limit = 100000
+
+    entries: list[dict] = []
+    state = {"truncated": False}
+
+    def _visit(ea: int, fpos: int, org_val: int, patch_val: int) -> int:
+        if len(entries) >= limit:
+            state["truncated"] = True
+            return 1  # non-zero stops the walk
+        entries.append(
+            {
+                "addr": hex(ea),
+                "original": f"{org_val & 0xFF:02x}",
+                "patched": f"{patch_val & 0xFF:02x}",
+            }
+        )
+        return 0
+
+    ida_bytes.visit_patched_bytes(0, idaapi.BADADDR, _visit)
+    return {
+        "count": len(entries),
+        "patches": entries,
+        "truncated": state["truncated"],
+    }

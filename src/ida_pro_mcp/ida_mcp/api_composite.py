@@ -5,9 +5,9 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Annotated, Any, TypedDict
 
-from .rpc import tool, unsafe, safety, title
-from .sync import idasync, tool_timeout, IDAError
-from .utils import (
+from ._kernel.rpc import tool, unsafe, safety, title
+from ._kernel.sync import idasync, tool_timeout, IDAError
+from ._kernel.utils import (
     parse_address,
     get_prototype,
     get_callees,
@@ -19,6 +19,7 @@ from .utils import (
     decompile_function_safe,
     get_assembly_lines,
     normalize_list_input,
+    bump_decompile_dirty,
 )
 
 # Max decompile lines before truncation.
@@ -579,8 +580,9 @@ def diff_before_after(
     except Exception as exc:
         return {"error": f"Action {action!r} failed: {exc}"}
 
-    # --- After (invalidate Hex-Rays cache so we see the change) ---
+    # --- After (invalidate BOTH the Hex-Rays cache and our cfunc cache) ---
     ida_hexrays.mark_cfunc_dirty(ea)
+    bump_decompile_dirty(ea)
     after, _ = decompile_function_safe(ea)
 
     return {
